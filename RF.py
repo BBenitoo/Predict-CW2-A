@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Nov 18 10:50:21 2025
-
-@author: a1
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Nov 18 09:48:47 2025
+Created on Tue Nov 18 15:34:20 2025
 
 @author: a1
 """
@@ -23,6 +15,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.base import BaseEstimator, TransformerMixin
 from scipy.stats import zscore
+from sklearn.model_selection import GridSearchCV
 
 RNG = 42
 np.random.seed(RNG)
@@ -90,7 +83,7 @@ preprocess = ColumnTransformer([
         ('scaler', StandardScaler())
     ]), numeric_cols)
 ])
-
+X_prepared = preprocess.fit_transform(X)
 # === Step 5: Train/Test split ===
 age_bins = pd.qcut(df['Age'], q=10, duplicates='drop')
 X_train, X_test, y_train, y_test, age_train, age_test = train_test_split(
@@ -99,15 +92,90 @@ X_train, X_test, y_train, y_test, age_train, age_test = train_test_split(
     random_state=RNG,
     stratify=age_bins
 )
+# === Step 6: OOB error vs n_estimators ===
+n_list = list(range(50, 1001, 50))
+oob_errors = []
 
+for n in n_list:
+    rf = RandomForestRegressor(
+        n_estimators=n,
+        oob_score=True,
+        bootstrap=True,
+        max_depth=None,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        max_features="sqrt",
+        criterion="squared_error",
+        random_state=RNG,
+        n_jobs=-1
+    )
+    rf.fit(X_prepared, y)
+    oob_r2 = rf.oob_score_
+    oob_errors.append(1 - oob_r2)  
 
-# 定义样本权重：线性提升高龄权重（也可用指数/分段）
+plt.figure(figsize=(10,6))
+plt.plot(n_list, oob_errors, marker='o', linestyle='-')
+plt.xlabel("n_estimators")
+plt.ylabel("1 - OOB R² (OOB error)")
+plt.title("OOB Error vs n_estimators (RandomForestRegressor)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === step 7:Rf Parameter grid search with determinate estimators===
+pipe_rf = Pipeline([
+    ('prep', preprocess),
+    ('reg', RandomForestRegressor(random_state=42))
+])
+'''
+param_grid_rf = {
+    'reg__n_estimators': [410],  # searching by OOB error
+    'reg__max_depth': [None, 10, 20, 30],  
+    'reg__min_samples_split': [2, 5, 10],  
+    'reg__min_samples_leaf': [1, 2, 4],    
+    'reg__max_features': ['sqrt', 'log2', 0.5, 0.8],  
+    'reg__criterion': ['squared_error', 'absolute_error']  # Comparison of two loss functions
+}
+
+grid_rf = GridSearchCV(
+    estimator=pipe_rf,
+    param_grid=param_grid_rf,
+    scoring='r2',
+    cv=5,
+    n_jobs=-1,
+    verbose=2
+)
+
+start_time = time.time()
+grid_rf.fit(X_train, y_train)
+end_time = time.time()
+rf_train_time = end_time - start_time
+
+print("Best Parameters:", grid_rf.best_params_)
+print("Best CV R²:", grid_rf.best_score_)
+print("Training Time (s):", rf_train_time)
+'''
+# === step 8:Best Rf parameter===
+final_rf_w = Pipeline([
+    ("prep", preprocess),
+    ("reg", RandomForestRegressor(
+        n_estimators=410,
+        max_depth=None,
+        min_samples_split=5,
+        min_samples_leaf=4,
+        max_features="sqrt",
+        criterion="squared_error",
+        random_state=RNG,
+        n_jobs=-1
+    ))
+])
+# === step 9:Define sample weights: linearly increase the weight of the elderly (exponential / segmented methods can also be used)）
 age_train = y_train.copy()
 age_min, age_max = age_train.min(), age_train.max()
-w = 1.0 + 2.0*(age_train - age_min) / (age_max - age_min)  # 权重范围约 [1, 3]
-# ...（前面部分保持不变，直到你定义完 final_rf_w 并输出全局加权训练性能）...
+w = 1.0 + 2.0*(age_train - age_min) / (age_max - age_min)  # Weight range approximately [1, 3]
 
-# === Step 6: 分段建模 + 段内加权优化 ===
+
+# === Step 10: Segment-based modeling & In-segment weighted optimization===
 bins = [0, 8, 12, np.inf]
 labels = ["low", "mid", "high"]
 df["AgeSegment"] = pd.cut(df["Age"], bins=bins, labels=labels)
@@ -129,7 +197,7 @@ for label in labels:
         stratify=pd.qcut(age_seg, q=5, duplicates='drop')
     )
 
-    # 段内权重策略
+    # Intra-segment weighting strategy
     seg_min, seg_max = age_train_seg.min(), age_train_seg.max()
     if label == "high":
         w_seg = 1.0 + 2.5 * (age_train_seg - seg_min) / (seg_max - seg_min)
@@ -167,8 +235,8 @@ for label in labels:
     mse = mean_squared_error(y_test_seg, y_pred_seg)
 
     print(f"\n--- Segment [{label}] ---")
-    print("样本数：", len(X_seg))
-    print("训练时间（秒）：", train_time)
+    print("samples：", len(X_seg))
+    print("train（s）：", train_time)
     print("R²：", r2)
     print("MAE：", mae)
     print("MSE：", mse)
@@ -177,37 +245,27 @@ for label in labels:
     segment_preds.append(y_pred_seg)
     segment_true.append(y_test_seg)
 
-# === Step 7: 合并所有预测结果，评估整体性能 ===
+# === Step 11: Merge all the prediction results and evaluate the overall performance ===
 y_all = np.concatenate(segment_true)
 y_pred_all = np.concatenate(segment_preds)
 
-print("\n=== 分段建模整体性能（含段内加权优化） ===")
+print("\n=== Segment-based modeling of overall performance (including intra-segment weighted optimization) ===")
 print("R²：", r2_score(y_all, y_pred_all))
 print("MAE：", mean_absolute_error(y_all, y_pred_all))
 print("MSE：", mean_squared_error(y_all, y_pred_all))
 
-final_rf_w = Pipeline([
-    ("prep", preprocess),
-    ("reg", RandomForestRegressor(
-        n_estimators=410,
-        max_depth=None,
-        min_samples_split=5,
-        min_samples_leaf=4,
-        max_features="sqrt",
-        criterion="squared_error",
-        random_state=RNG,
-        n_jobs=-1
-    ))
-])
 
 t0 = time.time()
-final_rf_w.fit(X_train, y_train, reg__sample_weight=w)  # 关键：传入 sample_weight
+final_rf_w.fit(X_train, y_train, reg__sample_weight=w)  # key:input sample_weight
 train_time = time.time() - t0
 
 y_pred_w = final_rf_w.predict(X_test)
-print("\n--- RF + 高龄加权 性能 ---")
-print("训练时间（秒）：", train_time)
+print("\n--- only perform with age weighting---")
+print("train time（s）：", train_time)
 print("MSE：", mean_squared_error(y_test, y_pred_w))
 print("MAE：", mean_absolute_error(y_test, y_pred_w))
 print("R²：", r2_score(y_test, y_pred_w))
+
+
+
 
